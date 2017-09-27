@@ -17,11 +17,16 @@ using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("FrontLineDrops", "Rokumnaehn", "0.9.1", ResourceId = 1934)]
+    [Info("FrontLineDrops", "Rokumaehn", "0.9.1", ResourceId = 1934)]
     [Description("Frontline supply airdrops for rust")]
     class FrontLineDrops : RustPlugin
     {
-        Dictionary<ulong, StorageContainer> _playerChests = new Dictionary<ulong, StorageContainer>();
+        Dictionary<ulong, StorageContainer> _playerChests = new Dictionary<ulong, StorageContainer>(); // list of registered supply chests by player-id
+        Dictionary<ulong, ulong> _playerNextDropAllowance = new Dictionary<ulong, ulong>(); // list of timestamps(timeout to next supply drop) for each player
+        private Timer _timerSecondsCounter;  // timer for timestamp counter
+        private ulong _secondsElapsed = 0UL; // timestamp counter
+        static ulong SupplyDropDelay = 15UL; // minimal delay before the next supply drop can be called by a player
+        static int SupplyChestCapacity = 6;  // the number of slots the supply system should use
 
         [PluginReference]
         Plugin BetterLoot;
@@ -572,23 +577,16 @@ namespace Oxide.Plugins
                     StorageContainer theLoot = GetComponent<StorageContainer>();
 
                     // Remove (destroy) all items from the airdrop
-                    List<Item> ilist = new List<global::Item>();
-                    foreach (var item in theLoot.inventory.itemList)
-                    {
-                        ilist.Add(item);
-                    }
-                    foreach (var item in ilist)
-                    {
-                        item.Remove(0.0f);
-                    }
+                    var iarr = theLoot.inventory.itemList.ToArray();
+                    for (int i = 0; i < iarr.Length; i++) iarr[i].Remove();
 
                     ulong userID = (ulong)(cratesettings["userID"]);
                     var pl = BasePlayer.FindByID(userID);
 
-                    // Add the correct loot
                     if (cratesettings.ContainsKey("Custom") && (bool)(cratesettings["Custom"]))
                     {
-                        if(fd._playerChests.ContainsKey(userID))
+                        // Add the correct loot
+                        if (fd._playerChests.ContainsKey(userID))
                         {
                             if(fd._playerChests[userID].IsDestroyed)
                             {
@@ -596,22 +594,28 @@ namespace Oxide.Plugins
                                 return;
                             }
 
-                            foreach (var item in fd._playerChests[userID].inventory.itemList)
+                            iarr = fd._playerChests[userID].inventory.itemList.ToArray();
+                            for (int i = 0; i < iarr.Length && i < SupplyChestCapacity; i++)
                             {
-                                item.MoveToContainer(theLoot.inventory);
+                                fd.Puts("Moving item " + iarr[i].name);
+                                iarr[i].MoveToContainer(theLoot.inventory);
                             }
 
                             fd.SendReply(pl, $"<color={fd.colorAdmMsg}>Supply box contents are inbound on your location!</color>");
-                            fd.PrintToChat(pl, $"<color={fd.colorAdmMsg}>Supply box contents are inbound on your location!</color>");
+                            //fd.PrintToChat(pl, $"<color={fd.colorAdmMsg}>Supply box contents are inbound on your location!</color>");
                         }
                     }
                     else
                     {
                         // drop some insane stuff
                         theLoot.inventory.AddItem(ItemManager.FindItemDefinition("explosive.timed"), 20);
-                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("ammo.rocket.hv"), 20);
                         theLoot.inventory.AddItem(ItemManager.FindItemDefinition("rocket.launcher"), 1);
-
+                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("ammo.rocket.hv"), 20);
+                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("rifle.lr300"), 1);
+                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("ammo.rifle.hv"), 1024);
+                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("lmg.m249"), 1);
+                        theLoot.inventory.AddItem(ItemManager.FindItemDefinition("ammo.rifle.explosive"), 1024);
+                        
                         fd.SendReply(pl, $"<color={fd.colorAdmMsg}>Supplies are inbound on your location!</color>");
                     }
 
@@ -871,65 +875,42 @@ namespace Oxide.Plugins
         {
             SupplyDrop newDrop;
             object value;
-            if (cratesettings.TryGetValue("userID", out value))
+
+            if(!cratesettings.TryGetValue("userID", out value))
             {
-                newDrop = GameManager.server.CreateEntity("assets/prefabs/misc/supply drop/supply_drop.prefab", pos, new Quaternion(), true) as SupplyDrop;
-                (newDrop as BaseEntity).OwnerID = (ulong)value;
+                Puts("Something went wrong. A userID was expected.");
+                return;
             }
-            else
-                newDrop = GameManager.server.CreateEntity("assets/prefabs/misc/supply drop/supply_drop.prefab", pos, Quaternion.LookRotation(end - start), true) as SupplyDrop;
-            
+
+            newDrop = GameManager.server.CreateEntity("assets/prefabs/misc/supply drop/supply_drop.prefab", pos, new Quaternion(), true) as SupplyDrop;
+            (newDrop as BaseEntity).OwnerID = (ulong)value;
             (newDrop as BaseNetworkable).gameObject.AddComponent<ColliderCheck>();
-            if (cratesettings.ContainsKey("maxItems")) cratesettings.Remove("maxItems");
             newDrop.GetComponent<ColliderCheck>().cratesettings = cratesettings;
             newDrop.GetComponent<ColliderCheck>().notifyEnabled = notify;
             newDrop.GetComponent<ColliderCheck>().notifyConsole = notifyConsole;
             newDrop.GetComponent<Rigidbody>().drag = Convert.ToSingle(cratesettings["crateAirResistance"]);
 
-            newDrop.GetComponent<LootContainer>().initialLootSpawn = false;
+            var theLoot = newDrop.GetComponent<LootContainer>();
+            theLoot.initialLootSpawn = false;
 
-            object obj = Interface.CallHook("OnFancyDropCrate", cratesettings);
-            if (obj != null)
+            theLoot.inventory = new ItemContainer();
+            if (cratesettings.TryGetValue("Custom", out value) && (bool)value)
             {
-                //newDrop.GetComponent<ColliderCheck>().cratesettings["AlCustom"] = true;
-                //newDrop.GetComponent<ColliderCheck>().cratesettings["AlCustomList"] = (List<Item>)obj;
-                SpawnNetworkable(newDrop as BaseNetworkable);
+                theLoot.inventory.ServerInitialize(null, SupplyChestCapacity);
+                theLoot.inventory.capacity = SupplyChestCapacity;
+                theLoot.inventorySlots = SupplyChestCapacity;
             }
             else
-                newDrop.Spawn();
+            {
+                theLoot.inventory.ServerInitialize(null, 32);
+                theLoot.inventory.capacity = 32;
+                theLoot.inventorySlots = 32;
+            }
+
+            newDrop.Spawn();
 
             SupplyDrops.Add(newDrop);
-            //if (useSupplyDropEffectNight && TOD_Sky.Instance.IsNight && (string)cratesettings["droptype"] != "supplysignal")
-            //	Effect.server.Run(supplyDropEffectSpawn, newDrop.transform.position - Vector3.up);
             if (supplyDropLight) createLantern(newDrop as BaseEntity);
-
-            /*
-            ItemContainer theLoot = newDrop.GetComponent<StorageContainer>().inventory;
-
-            foreach (var item in theLoot.itemList)
-            {
-                item.Remove();
-            }
-            //theLoot.itemList.Add(BuildItems(player, "explosive.timed", 1));
-            //BuildItems(player, "explosive.timed", 1).MoveToContainer(theLoot);
-            //BuildItems(player, "ammo.rocket.hv", 1).MoveToContainer(theLoot);
-            //BuildItems(player, "rocket.launcher", 1).MoveToContainer(theLoot);
-            theLoot.AddItem(ItemManager.FindItemDefinition("explosive.timed"), 1);
-            */
-        }
-
-
-        private Item BuildItems(BasePlayer player, string shortname, int amount)
-        {
-            var definition = ItemManager.FindItemDefinition(shortname); // Find the item definition from its shortname
-            if (definition != null)
-            {
-                SendReply(player, $"<color={colorAdmMsg}>Item found.</color>");
-                Item item = ItemManager.CreateByItemID(definition.itemid, amount); // Create the item itself
-                if (item != null)
-                    return item;
-            }
-            return null;
         }
 
         void SpawnNetworkable(BaseNetworkable ent)
@@ -1256,6 +1237,12 @@ namespace Oxide.Plugins
 
         void Init()
         {
+            _secondsElapsed = 0UL;
+            _timerSecondsCounter = timer.Repeat(1.0f, 0, () =>
+            {
+                _secondsElapsed++;
+            });
+
             fd = this;
             initialized = false;
             LoadVariables();
@@ -1344,6 +1331,14 @@ namespace Oxide.Plugins
 
         void Unload()
         {
+            _timerSecondsCounter.Destroy();
+
+            var chests = new Dictionary<ulong, int>();
+            foreach (var item in _playerChests)
+            {
+                chests.Add(item.Key, item.Value.GetInstanceID());
+            }
+
             airdropTimerStop();
             foreach (var container in UnityEngine.Object.FindObjectsOfType<SupplyDrop>())
                 foreach (var obj in container.gameObject.GetComponents<ColliderCheck>())
@@ -1712,11 +1707,11 @@ namespace Oxide.Plugins
         [ChatCommand("fsd.dropme")]
         void fsdDropMe(BasePlayer player, string command, string[] args)
         {
-            //if (player.net.connection.authLevel < neededAuthLvl)
-            //{
-            //    SendReply(player, string.Format(Format, Color, Prefix) + lang.GetMessage("msgNoAccess", this));
-            //    return;
-            //}
+            if (player.net.connection.authLevel < neededAuthLvl)
+            {
+                SendReply(player, string.Format(Format, Color, Prefix) + lang.GetMessage("msgNoAccess", this));
+                return;
+            }
             
             var newpos = new Vector3();
             newpos = player.transform.position;
@@ -1757,6 +1752,44 @@ namespace Oxide.Plugins
             newpos = player.transform.position;
             newpos.y += 100;
 
+            // Verifying some stuff first...
+            StorageContainer plChest = null;
+            if(_playerChests.ContainsKey(player.userID))
+            {
+                plChest = _playerChests[player.userID];
+
+                if(plChest.IsDestroyed)
+                {
+                    SendReply(player, $"<color={colorAdmMsg}>Your supply chest was destroyed. Go ahead an register a new one!</color>");
+                    return;
+                }
+                if(plChest.inventory==null || plChest.inventory.itemList==null || plChest.inventory.itemList.Count==0)
+                {
+                    SendReply(player, $"<color={colorAdmMsg}>Your supply chest does not contain any items.</color>");
+                    return;
+                }
+            }
+            else
+            {
+                SendReply(player, $"<color={colorAdmMsg}>You have to register a supply chest first.</color>");
+                return;
+            }
+            if(_playerNextDropAllowance.ContainsKey(player.userID))
+            {
+                if(_playerNextDropAllowance[player.userID] <= _secondsElapsed)
+                {
+                    _playerNextDropAllowance[player.userID] = _secondsElapsed + SupplyDropDelay; // Queue next point in time when the player will be able to call again
+
+                    SendReply(player, $"<color={colorAdmMsg}>ok. timestamp is {_secondsElapsed}. Your next call will be at {_playerNextDropAllowance[player.userID]}</color>");
+                }
+                else
+                {
+                    SendReply(player, $"<color={colorAdmMsg}>Not ready yet. Your next supply drop will be available in {(_playerNextDropAllowance[player.userID] - _secondsElapsed)} seconds.</color>");
+                    return;
+                }
+            }
+
+            // Setup the drop
             Dictionary<string, object> setting;
             if (setupDropTypes.ContainsKey("dropdirect"))
             {
@@ -1785,8 +1818,8 @@ namespace Oxide.Plugins
             float defaultRayDistance = 3.0f;
 
             RaycastHit RayHit;
-            bool flag1 = Physics.Raycast(player.eyes.HeadRay(), out RayHit, defaultRayDistance, defaultLayerMask);
-            var TargetEntity = flag1 ? RayHit.GetEntity() : null;
+            bool wasHit = Physics.Raycast(player.eyes.HeadRay(), out RayHit, defaultRayDistance, defaultLayerMask);
+            var TargetEntity = wasHit ? RayHit.GetEntity() : null;
 
             if (TargetEntity == null)
             {
@@ -1804,6 +1837,10 @@ namespace Oxide.Plugins
             SendReply(player, $"<color={colorAdmMsg}>Success. This is now your supply chest.</color>");
 
             _playerChests[player.userID] = box;
+            _playerNextDropAllowance[player.userID] = _secondsElapsed + SupplyDropDelay;
+
+            SendReply(player, $"<color={colorAdmMsg}>timestamp is {_secondsElapsed}</color>");
+            SendReply(player, $"<color={colorAdmMsg}>You will be able to call at {_playerNextDropAllowance[player.userID]}</color>");
         }
 
         [ConsoleCommand("ad.timer")]
